@@ -3,8 +3,14 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
+      channel:
+        description: "test: build a pre-release image. release: cut an official SemVer release"
+        required: true
+        type: choice
+        options: [test, release]
+        default: test
       version:
-        description: "Test version (SemVer pre-release), e.g. 0.2.0-rc.1"
+        description: "SemVer version. test: X.Y.Z or X.Y.Z-rc.N. release: strict X.Y.Z only (no suffix)"
         required: true
         type: string
       ref:
@@ -17,12 +23,9 @@ on:
         required: true
         type: string
         default: https://api.example.com
-  push:
-    tags:
-      - "v*"
 
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}-${{ inputs.version || github.ref_name }}
+  group: release-${{ github.workflow }}-${{ inputs.channel }}-${{ inputs.version }}
   cancel-in-progress: false
 
 permissions:
@@ -31,14 +34,14 @@ permissions:
 
 jobs:
   test-channel:
-    name: Publish test image
-    if: github.event_name == 'workflow_dispatch'
+    name: Build and publish test image
+    if: inputs.channel == 'test'
     runs-on: ubuntu-latest
     steps:
-      - name: Validate SemVer pre-release version
+      - name: Validate SemVer version
         run: |
-          echo "${{ inputs.version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$' || {
-            echo "::error::version must be SemVer pre-release, e.g. 0.2.0-rc.1"; exit 1; }
+          echo "${{ inputs.version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || {
+            echo "::error::version must be SemVer, e.g. 0.2.0 or 0.2.0-rc.1"; exit 1; }
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
@@ -63,16 +66,25 @@ jobs:
             ghcr.io/${{ steps.image.outputs.repository }}:sha-${{ github.sha }}
 
   release-channel:
-    name: Publish release image
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    name: Tag, build and publish release
+    if: inputs.channel == 'release'
     runs-on: ubuntu-latest
     steps:
-      - name: Validate SemVer release tag (no pre-release suffix)
+      - name: Validate strict SemVer (no pre-release suffix)
         run: |
-          echo "${{ github.ref_name }}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
-            echo "::error::Release tags must be plain SemVer (vX.Y.Z), no pre-release suffix. Use the workflow_dispatch test channel for pre-releases."
+          echo "${{ inputs.version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "::error::Release channel requires strict SemVer X.Y.Z, no pre-release suffix. Got: ${{ inputs.version }}"
             exit 1; }
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - name: Create and push git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ inputs.version }}" -m "Release v${{ inputs.version }}"
+          git push origin "v${{ inputs.version }}"
       - id: image
         run: echo "repository=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v3
@@ -88,14 +100,12 @@ jobs:
           platforms: linux/arm64
           push: true
           build-args: |
-            VITE_API_URL=https://api.${{ vars.APP_DOMAIN || 'example.com' }}
+            VITE_API_URL=${{ inputs.api_url }}
           tags: |
-            ghcr.io/${{ steps.image.outputs.repository }}:release-${{ github.ref_name }}
+            ghcr.io/${{ steps.image.outputs.repository }}:release-v${{ inputs.version }}
             ghcr.io/${{ steps.image.outputs.repository }}:latest
             ghcr.io/${{ steps.image.outputs.repository }}:sha-${{ github.sha }}
-      - name: Create GitHub Release if missing
-        run: |
-          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 || \
-          gh release create "${{ github.ref_name }}" --generate-notes --title "${{ github.ref_name }}"
+      - name: Create GitHub Release
+        run: gh release create "v${{ inputs.version }}" --generate-notes --title "v${{ inputs.version }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
